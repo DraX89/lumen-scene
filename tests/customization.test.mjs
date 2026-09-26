@@ -1,0 +1,28 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
+import * as T from 'three';
+import {makeAsset} from '../dist/assets.js';
+import {KINDS,THEMES,element,initialScene,validateScene,SceneStore,createCustomScene,openCustomScene,stashCustomScene,sceneTheme} from '../dist/model.js';
+import {colorSlots,randomAt} from '../dist/asset-schema.js';
+import {validateDashboard,placeWidget} from '../dist/dashboard-model.js';
+import {MockHub} from '../dist/adapters.js';
+import {SceneView} from '../dist/scene.js';
+
+function fingerprint(e){const g=makeAsset(e,THEMES.forest),hash=createHash('sha256');g.traverse(o=>{hash.update(JSON.stringify([o.position.toArray(),o.scale.toArray(),o.rotation.toArray()]));for(const a of [o.geometry?.attributes.position?.array,o.geometry?.attributes.color?.array,o.instanceMatrix?.array,o.instanceColor?.array])if(a)hash.update(Buffer.from(a.buffer));for(const m of [o.material].flat().filter(Boolean)){hash.update(JSON.stringify([m.color?.toArray(),m.emissive?.toArray(),m.uniforms?.color?.value?.toArray()]));for(const t of [m.map,m.uniforms?.tNormalMap0?.value])if(t?.image?.data)hash.update(Buffer.from(t.image.data.buffer));}});g.traverse(o=>{if(o.userData.flowWater)o.dispose();o.geometry?.dispose();for(const m of [o.material].flat().filter(Boolean)){m.map?.dispose();m.dispose();}});return hash.digest('hex');}
+for(const kind of KINDS){
+  test('seeded '+kind+' is stable and reroll changes the rendered asset',()=>{const e=element(kind,'deterministic');e.seed=31;const a=fingerprint(e);assert.equal(fingerprint(e),a);e.seed=92;assert.notEqual(fingerprint(e),a);e.variation=0;const regular=fingerprint(e);e.variation=1;assert.notEqual(fingerprint(e),regular);});
+  for(const slot of Object.keys(colorSlots(kind)))test(kind+' colour '+slot+' affects the rendered material',()=>{const e=element(kind,'palette');const before=fingerprint(e);e.colors[slot]='#ff3300';assert.notEqual(fingerprint(e),before);});
+}
+test('leaving edit mode removes and disposes selection helper; updates cannot restore it',()=>{const view=Object.create(SceneView.prototype),g=new T.Group();g.add(new T.Mesh(new T.BoxGeometry(),new T.MeshBasicMaterial()));Object.assign(view,{mode:'move',controls:{},host:{style:{}},scene:new T.Scene(),items:new Map([['selected',g]])});view.highlight('selected');const box=view.box;let disposed=0;box.geometry.addEventListener('dispose',()=>disposed++);view.setMode('fixed');assert.equal(view.box,null);assert.equal(view.selected,null);assert.equal(disposed,1);view.highlight('selected');assert.equal(view.box,null);});
+test('widget opacity and gap persist through rearrangement and validation',()=>{const d=initialScene().dashboard;d.opacity=0;d.gap=32;const next=placeWidget(d,'home',{x:2});assert.equal(next.opacity,0);assert.equal(next.gap,32);assert.deepEqual(validateDashboard(next),next);});
+for(const [key,value] of [['opacity',-1],['opacity',1.1],['opacity',NaN],['gap',33],['gap',-1],['gap','10']])test('reject bad widget appearance '+key+value,()=>{const d=initialScene().dashboard;d[key]=value;assert.throws(()=>validateDashboard(d));});
+test('legacy asset and appearance defaults do not mutate input',()=>{const s=initialScene();delete s.dashboard.opacity;delete s.dashboard.gap;for(const e of s.elements){delete e.seed;delete e.variation;delete e.colors;}const next=validateScene(s);assert.equal(next.dashboard.opacity,.65);assert.equal(next.dashboard.gap,11);assert.ok(Number.isInteger(next.elements[0].seed));assert.equal(s.elements[0].seed,undefined);});
+test('custom scenes retain independent drafts and share current dashboard',()=>{let s=createCustomScene(initialScene(),'Moonlit garden','forest','garden');s.elements[0].seed=567;s.custom.palette.background='#123456';stashCustomScene(s);s=createCustomScene(s,'Ocean dome','sea','ocean');s.dashboard.gap=25;const garden=openCustomScene(s,'garden');assert.equal(garden.elements[0].seed,567);assert.equal(sceneTheme(garden).background,'#123456');assert.equal(garden.dashboard.gap,25);assert.equal(s.custom.name,'Ocean dome');});
+test('blank custom stage keeps clock and dashboard without inherited scenery',()=>{const s=createCustomScene(initialScene(),'New world','blank','blank');assert.deepEqual(s.elements.map(e=>e.kind),['clock']);assert.equal(s.dashboard.widgets.length,6);assert.equal(s.library.length,1);});
+test('custom scene, palette, seed and widget appearance survive hub and undo',async()=>{const s=new SceneStore(initialScene());s.edit(x=>Object.assign(x,createCustomScene(x,'My world','current','mine')));s.edit(x=>{x.elements[1].seed=13;x.elements[1].colors.matrix='#112233';x.dashboard.opacity=.2;stashCustomScene(x);});const saved=structuredClone(s.scene);s.undo();assert.equal(s.scene.dashboard.opacity,.65);s.redo();assert.deepEqual(s.scene,saved);const hub=new MockHub({latency:0});await hub.save('desktop',s.scene,0);assert.deepEqual((await hub.pull('desktop')).scene,saved);});
+test('custom scene limits and invalid colors are rejected atomically',()=>{let s=initialScene();for(let i=0;i<8;i++)s=createCustomScene(s,'Scene '+i,'blank','s'+i);assert.throws(()=>createCustomScene(s,'Overflow','blank','nine'),/maximum/);assert.equal(s.library.length,8);s.custom.palette.ground='javascript:bad';assert.throws(()=>validateScene(s),/custom/);});
+test('seed and palette reject malformed server input',()=>{for(const change of [e=>e.seed=-1,e=>e.seed=2**32,e=>e.seed=1.5,e=>e.variation=2,e=>e.colors.matrix='red']){const s=initialScene();change(s.elements[1]);assert.throws(()=>validateScene(s));}});
+test('seeded random samples are bounded and deterministic',()=>{for(let i=0;i<100;i++){const v=randomAt(123,i);assert.ok(v>=0&&v<1);assert.equal(v,randomAt(123,i));}});
+
+

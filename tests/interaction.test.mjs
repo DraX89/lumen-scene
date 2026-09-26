@@ -1,0 +1,33 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import * as T from 'three';
+import {SceneView} from '../dist/scene.js';
+import {FlowWater,flowPhase,waterNormalMap} from '../dist/water.js';
+import {initialScene,validateScene,SceneStore} from '../dist/model.js';
+import {MockHub} from '../dist/adapters.js';
+
+function fixture(){
+  const view=Object.create(SceneView.prototype),object=new T.Group(),commits=[];object.userData.id='a';
+  const captures=new Set();
+  Object.assign(view,{mode:'move',items:new Map([['a',object]]),controls:{enabled:false},host:{style:{},setPointerCapture:id=>captures.add(id),hasPointerCapture:id=>captures.has(id),releasePointerCapture:id=>{captures.delete(id);view.cancelDrag();}},ray:{intersectObjects:()=>[{object}],ray:{intersectPlane:(_,p)=>p.set(0,0,0)}},plane:new T.Plane(),hit:new T.Vector3(),cast(){},onSelect(){view.setMode('move');},onMove:(id,p)=>commits.push({id,p})});
+  return {view,object,commits};
+}
+const event=(pointerId=1)=>({button:0,clientX:10,clientY:10,pointerId,preventDefault(){},stopPropagation(){}});
+test('two consecutive object drags commit and keep orbit disabled, including capture loss',()=>{
+  const {view,object,commits}=fixture();
+  for(let i=1;i<=2;i++){view.pointerDown(event(i));assert.ok(view.drag);view.ray.ray.intersectPlane=(_,p)=>p.set(i,0,0);view.pointerMove(event(i));view.pointerUp(event(i));assert.equal(view.mode,'move');assert.equal(view.controls.enabled,false);assert.equal(view.drag,null);}
+  assert.equal(commits.length,2);assert.notEqual(commits[0].p[0],commits[1].p[0]);assert.deepEqual(object.position.toArray(),commits[1].p);
+});
+test('cancelled drag restores position and subsequent drag works',()=>{const {view,object}=fixture();view.pointerDown(event());object.position.x=4;view.cancelDrag();assert.equal(object.position.x,0);assert.equal(view.controls.enabled,false);view.pointerDown(event());assert.ok(view.drag);});
+test('second pointer cannot move or finish active drag',()=>{const {view,object,commits}=fixture();view.pointerDown(event());view.ray.ray.intersectPlane=(_,p)=>p.set(5,0,0);view.pointerMove(event(2));view.pointerUp(event(2));assert.equal(object.position.x,0);assert.equal(commits.length,0);assert.ok(view.drag);});
+test('parallel ray never starts a corrupt drag',()=>{const {view}=fixture();view.ray.ray.intersectPlane=()=>null;view.pointerDown(event());assert.equal(view.drag,undefined);});
+test('changing tools rolls back an unfinished drag',()=>{const {view,object}=fixture();view.pointerDown(event());object.position.x=3;view.setMode('orbit');assert.equal(object.position.x,0);assert.equal(view.controls.enabled,true);});
+test('water flow phase wraps continuously with the two phase blend',()=>{for(const time of [0,1,60,1e6]){const p=flowPhase(time,2);assert.ok(p>=0&&p<.15);}assert.equal(flowPhase(999,0),0);});
+test('water animation uses supplied clock, direction, waves and key light',()=>{const w=new FlowWater('#234455');const l=new T.PointLight('#ff2200',42);l.position.set(2,4,1);const settings={speed:.8,waves:.1,direction:90};w.animate(3,settings,l);const u=w.material.uniforms;assert.equal(u.amplitude.value,.1);assert.ok(Math.abs(u.flowDirection.value.y-1)<1e-9);assert.deepEqual(u.keyPosition.value.toArray(),[2,4,1]);assert.equal(u.keyPower.value,42);const phase=u.config.value.x;w.animate(3,settings,l);assert.equal(u.config.value.x,phase);w.dispose();w.geometry.dispose();w.material.dispose();});
+test('water owns and disposes both targets and normals exactly once',()=>{const w=new FlowWater('#123456');let disposed=0;for(const resource of [w.reflector.getRenderTarget(),w.refractor.getRenderTarget(),w.material.uniforms.tNormalMap0.value,w.material.uniforms.tNormalMap1.value])resource.addEventListener('dispose',()=>disposed++);w.dispose();w.dispose();assert.equal(disposed,4);w.geometry.dispose();w.material.dispose();});
+test('nested water captures are excluded and visibility is restored after an error',()=>{const a=new FlowWater('#123456'),b=new FlowWater('#234567'),scene=new T.Scene(),camera=new T.PerspectiveCamera();scene.add(a,b);a.reflector.onBeforeRender=()=>{assert.equal(a.visible,false);assert.equal(b.visible,false);};a.refractor.onBeforeRender=()=>{throw new Error('capture failed');};assert.throws(()=>a.onBeforeRender({},scene,camera),/capture failed/);assert.equal(a.visible,true);assert.equal(b.visible,true);for(const w of [a,b]){w.dispose();w.geometry.dispose();w.material.dispose();}});
+test('single source disables all extra lamps and studio mode restores them',()=>{const view=Object.create(SceneView.prototype);Object.assign(view,{scene:new T.Scene(),base:{material:{color:new T.Color()}},ring:{material:{color:new T.Color()}},key:new T.PointLight(),fill:new T.PointLight(),ambient:new T.HemisphereLight(),bloom:{},renderer:{},items:new Map(),highlight(){}});const s=initialScene();view.update(s);assert.equal(view.fill.intensity,0);let lamps=[];for(const g of view.items.values())g.traverse(o=>{if(o.isPointLight)lamps.push(o);});assert.equal(lamps.length,2);assert.ok(lamps.every(l=>!l.visible));s.lighting.singleSource=false;view.update(s);assert.ok(view.fill.intensity>0);assert.ok(lamps.every(l=>l.visible));for(const g of view.items.values())view.disposeObject(g);});
+test('procedural normal texture is deterministic and nonconstant',()=>{const a=waterNormalMap(),b=waterNormalMap();assert.deepEqual(a.image.data,b.image.data);assert.ok(new Set(a.image.data).size>30);a.dispose();b.dispose();});
+test('legacy scene gains water and light defaults without changing input',()=>{const old=initialScene();delete old.water;delete old.lighting.position;delete old.lighting.singleSource;delete old.lighting.ambient;const next=validateScene(old);assert.equal(next.water.speed,.6);assert.equal(next.lighting.singleSource,true);assert.equal(old.water,undefined);});
+for(const mutate of [s=>s.water.speed=Infinity,s=>s.water.waves=-1,s=>s.water.direction=181,s=>s.lighting.singleSource='true',s=>s.lighting.position=[0,NaN,0],s=>s.lighting.ambient=2])test('invalid rendering configuration rejected '+mutate.toString(),()=>{const s=initialScene();mutate(s);assert.throws(()=>validateScene(s));});
+test('water and key-light configuration survive hub roundtrip and undo',async()=>{const store=new SceneStore(initialScene());store.edit(s=>{s.water.direction=-45;s.lighting.position=[4,6,-3];s.lighting.ambient=0;});const h=new MockHub({latency:0});await h.save('desktop',store.scene,0);assert.deepEqual((await h.pull('desktop')).scene,store.scene);store.undo();assert.equal(store.scene.water.direction,15);store.redo();assert.equal(store.scene.lighting.ambient,0);});
